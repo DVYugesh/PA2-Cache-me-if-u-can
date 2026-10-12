@@ -137,7 +137,11 @@ void CACHE::handle_fill()
         if ((cache_type == IS_LLC) && (way == LLC_WAY)) { // this is a bypass that does not fill the LLC
 
             // update replacement policy
+<<<<<<< HEAD
             (this->*update_replacement_state)(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, 0, MSHR.entry[mshr_index].type, 0, MSHR.entry[mshr_index].instruction);
+=======
+            (this->*update_replacement_state)(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, 0, MSHR.entry[mshr_index].type, 0);
+>>>>>>> 0ad56f554ef86e1fb424d38493ebe4d0fd1d497d
 
             // COLLECT STATS
             sim_miss[fill_cpu][MSHR.entry[mshr_index].type]++;
@@ -524,7 +528,11 @@ void CACHE::handle_fill()
 #endif
 
             // update replacement policy
+<<<<<<< HEAD
             (this->*update_replacement_state)(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0, MSHR.entry[mshr_index].instruction);
+=======
+            (this->*update_replacement_state)(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0);
+>>>>>>> 0ad56f554ef86e1fb424d38493ebe4d0fd1d497d
 
             // COLLECT STATS
             sim_miss[fill_cpu][MSHR.entry[mshr_index].type]++;
@@ -556,7 +564,11 @@ void CACHE::handle_fill()
             {
                 uint32_t victim_way;
                 victim_way = ooo_cpu[fill_cpu].DTLB_PB.find_victim( fill_cpu, MSHR.entry[mshr_index].instr_id, 0, ooo_cpu[fill_cpu].DTLB_PB.block[0] , MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
+<<<<<<< HEAD
                 ooo_cpu[fill_cpu].DTLB_PB.update_replacement_state(fill_cpu, 0, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, ooo_cpu[fill_cpu].DTLB_PB.block[0][victim_way].full_addr, MSHR.entry[mshr_index].type, 0, MSHR.entry[mshr_index].instruction);
+=======
+                ooo_cpu[fill_cpu].DTLB_PB.update_replacement_state(fill_cpu, 0, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, ooo_cpu[fill_cpu].DTLB_PB.block[0][victim_way].full_addr, MSHR.entry[mshr_index].type, 0);
+>>>>>>> 0ad56f554ef86e1fb424d38493ebe4d0fd1d497d
                 ooo_cpu[fill_cpu].DTLB_PB.fill_cache( 0, victim_way, &MSHR.entry[mshr_index] );
             }
 #endif
@@ -1077,7 +1089,11 @@ if (writeback_cpu == NUM_CPUS)
 #endif
 
                     // update replacement policy
+<<<<<<< HEAD
                     (this->*update_replacement_state)(writeback_cpu, set, way, WQ.entry[index].full_addr, WQ.entry[index].ip, block[set][way].full_addr, WQ.entry[index].type, 0, WQ.entry[index].instruction);
+=======
+                    (this->*update_replacement_state)(writeback_cpu, set, way, WQ.entry[index].full_addr, WQ.entry[index].ip, block[set][way].full_addr, WQ.entry[index].type, 0);
+>>>>>>> 0ad56f554ef86e1fb424d38493ebe4d0fd1d497d
 
                     // COLLECT STATS
                     sim_miss[writeback_cpu][WQ.entry[index].type]++;
@@ -1540,7 +1556,11 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                     ooo_cpu[read_cpu].DTLB_PB.sim_access[read_cpu][RQ.entry[index].type]++;
                     ooo_cpu[read_cpu].DTLB_PB.HIT[RQ.entry[index].type]++;
                     ooo_cpu[read_cpu].DTLB_PB.ACCESS[RQ.entry[index].type]++;
+<<<<<<< HEAD
                     ooo_cpu[read_cpu].DTLB_PB.update_replacement_state(read_cpu, 0, way_pb, ooo_cpu[read_cpu].DTLB_PB.block[0][way_pb].full_addr, RQ.entry[index].ip, 0, RQ.entry[index].type, 1, RQ.entry[index].instruction);
+=======
+                    ooo_cpu[read_cpu].DTLB_PB.update_replacement_state(read_cpu, 0, way_pb, ooo_cpu[read_cpu].DTLB_PB.block[0][way_pb].full_addr, RQ.entry[index].ip, 0, RQ.entry[index].type, 1);
+>>>>>>> 0ad56f554ef86e1fb424d38493ebe4d0fd1d497d
                     RQ.entry[index].data = ooo_cpu[read_cpu].DTLB_PB.block[0][way_pb].data;
                     ooo_cpu[read_cpu].DTLB_PB.pf_useful++;
                     // If DTLB prefetch buffer gets hit, fill DTLB and then proceed
@@ -1763,7 +1783,11 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                 }
 
                 // update replacement policy
+<<<<<<< HEAD
                 (this->*update_replacement_state)(read_cpu, set, way, block[set][way].full_addr, RQ.entry[index].ip, 0, RQ.entry[index].type, 1, RQ.entry[index].instruction);
+=======
+                (this->*update_replacement_state)(read_cpu, set, way, block[set][way].full_addr, RQ.entry[index].ip, 0, RQ.entry[index].type, 1);
+>>>>>>> 0ad56f554ef86e1fb424d38493ebe4d0fd1d497d
 
                 // COLLECT STATS
                 sim_hit[read_cpu][RQ.entry[index].type]++;
@@ -2449,7 +2473,11 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                     if (way >= 0) { // prefetch hit
 
                         // update replacement policy
+<<<<<<< HEAD
                         (this->*update_replacement_state)(prefetch_cpu, set, way, block[set][way].full_addr, PQ.entry[index].ip, 0, PQ.entry[index].type, 1, PQ.entry[index].instruction);
+=======
+                        (this->*update_replacement_state)(prefetch_cpu, set, way, block[set][way].full_addr, PQ.entry[index].ip, 0, PQ.entry[index].type, 1);
+>>>>>>> 0ad56f554ef86e1fb424d38493ebe4d0fd1d497d
 
                         // COLLECT STATS
                         sim_hit[prefetch_cpu][PQ.entry[index].type]++;
