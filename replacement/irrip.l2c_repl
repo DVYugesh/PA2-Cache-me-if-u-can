@@ -1,0 +1,122 @@
+#include "cache.h"
+
+#define maxRRPV 3
+
+// ---- experiment knobs ----
+#define MAX_INSTR_WAYS     4   // instruction lines are protected only while a set holds <= this many (try 2, 4, 6)
+#define INSTR_INSERT_RRPV  1   // 0 = max protection, 1 = medium, 2 = same as data
+// --------------------------
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+bool     l2_is_instr[L2C_SET][L2C_WAY];   // does this way hold an instruction line?
+
+// debug counters (printed at end of simulation)
+uint64_t irrip_instr_fills = 0, irrip_data_fills = 0;
+uint64_t irrip_instr_hits  = 0, irrip_data_hits  = 0;
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Instruction-Conscious RRIP (I-RRIP v3) state for L2C" << endl;
+
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = false;
+        }
+    }
+}
+
+// find replacement victim
+// 1) Use an invalid way if one exists.
+// 2) Instruction lines are protected from eviction only while the set holds at most
+//    MAX_INSTR_WAYS of them (and at least one non-instruction line exists), so stale
+//    instruction lines cannot take over the whole set.
+// 3) Otherwise standard RRIP: evict a line at maxRRPV, aging the set if none is there.
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    for (int i=0; i<L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
+
+    int n_instr = 0;
+    for (int i=0; i<L2C_WAY; i++)
+        if (l2_is_instr[set][i]) n_instr++;
+
+    bool protect_instr = (n_instr <= MAX_INSTR_WAYS) && (n_instr < L2C_WAY);
+
+    while (1)
+    {
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_rrpv[set][i] >= maxRRPV && !(protect_instr && l2_is_instr[set][i]))
+                return i;
+
+        // age all lines, capped at maxRRPV
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_rrpv[set][i] < maxRRPV)
+                l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else if (type == LOAD_TRANSLATION)
+        TYPE_NAME = "L_TN";
+    else if (type == PREFETCH_TRANSLATION)
+        TYPE_NAME = "P_TN";
+    else if (type == TRANSLATION_FROM_L1D)
+        TYPE_NAME = "TN_L1D";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (hit) {
+        // PROMOTION: every hit goes to RRPV 0, as in RRIP.
+        if (isInstruction) {
+            irrip_instr_hits++;
+            l2_is_instr[set][way] = true;
+        } else {
+            irrip_data_hits++;
+        }
+        l2_rrpv[set][way] = 0;
+    } else {
+        // INSERTION: instruction lines get a better (lower) RRPV than data lines.
+        if (isInstruction) {
+            irrip_instr_fills++;
+            l2_is_instr[set][way] = true;
+            l2_rrpv[set][way] = INSTR_INSERT_RRPV;
+        } else {
+            irrip_data_fills++;
+            l2_is_instr[set][way] = false;
+            l2_rrpv[set][way] = maxRRPV - 1;
+        }
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "IRRIP instr fills: " << irrip_instr_fills << "  data fills: " << irrip_data_fills << endl;
+    cout << "IRRIP instr hits:  " << irrip_instr_hits  << "  data hits:  " << irrip_data_hits  << endl;
+}

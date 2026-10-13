@@ -429,7 +429,7 @@ void O3_CPU::read_from_trace()
 						{
 								BTB.sim_hit[cpu][ arch_instr. branch_type - 1]++;
 								BTB.sim_access[cpu][ arch_instr.branch_type - 1]++;
-								(BTB.*BTB.update_replacement_state)(cpu, btb_set, btb_way, arch_instr.ip, arch_instr.ip, 0, 0, 1);
+								(BTB.*BTB.update_replacement_state)(cpu, btb_set, btb_way, arch_instr.ip, arch_instr.ip, 0, 0, 1, 0);
 						}
 						else
 						{
@@ -453,7 +453,7 @@ void O3_CPU::read_from_trace()
 				{
 					BTB.sim_hit[cpu][ arch_instr. branch_type - 1]++;
                     BTB.sim_access[cpu][ arch_instr.branch_type - 1]++;
-                    (BTB.*BTB.update_replacement_state)(cpu, btb_set, btb_way, arch_instr.ip, arch_instr.ip, 0, 0, 1);
+                    (BTB.*BTB.update_replacement_state)(cpu, btb_set, btb_way, arch_instr.ip, arch_instr.ip, 0, 0, 1, 0);
 				}
 			}
 
@@ -980,7 +980,11 @@ void O3_CPU::fill_btb(uint64_t trigger, uint64_t target)
 	if(btb_way == BTB_WAY)
 	{
 		btb_way = (BTB.*BTB.find_victim)(cpu, 0, btb_set, BTB.block[btb_set], trigger, trigger, 0);
+<<<<<<< HEAD
+		(BTB.*BTB.update_replacement_state)(cpu, btb_set, btb_way, trigger, trigger, BTB.block[btb_set][btb_way].address, 0, 0, 0);
+=======
 		(BTB.*BTB.update_replacement_state)(cpu, btb_set, btb_way, trigger, trigger, BTB.block[btb_set][btb_way].address, 0, 0);
+>>>>>>> 0ad56f554ef86e1fb424d38493ebe4d0fd1d497d
 		BLOCK &entry = BTB.block[btb_set][btb_way];
 		if(entry.valid == 0)
 			entry.valid = 1;
