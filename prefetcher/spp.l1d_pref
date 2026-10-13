@@ -1,16 +1,446 @@
 #include "cache.h"
+#include <array>
+#include <algorithm>
 
+#define IP_TRACKER_COUNT 512
+#define MASK_IP 0xFFFF
+
+#define UNIFORM_THRESHOLD 4
+#define NON_UNIFORM_THRESHOLD 2
+#define MAX_COUNTER 15
+
+#define MAX_DEGREE 4
+#define EPOCH_PREFETCHES 256
+
+#define MAX_DELTAS 4
+
+// Pattern table size: 2^PT_BITS entries. The 12-bit signature is folded down when PT_BITS < 12.
+#define PT_BITS 10
+#define PT_ENTRIES (1 << PT_BITS)
+static inline uint16_t pt_index(uint16_t sig) {
+    return static_cast<uint16_t>((sig ^ (sig >> PT_BITS)) & (PT_ENTRIES - 1));
+}
+
+int prefetch_degree = 2;
+uint64_t epoch_issued = 0;
+uint64_t last_pf_useful = 0;
+uint64_t last_pf_lower = 0;
+uint64_t epochs_at_degree[MAX_DEGREE + 1] = {0};
+double prediction_threshold = 0.25;
+uint64_t tracker_allocs = 0;   // stats only: how often an IP tracker is (re)allocated
+
+// Adaptive prefetch distance driven by the late-prefetch ratio
+#define MAX_DISTANCE 8
+int      prefetch_distance = 1;
+uint64_t last_pf_late = 0;
+uint64_t epochs_at_distance[MAX_DISTANCE + 1] = {0};
+
+
+struct delta_entry {
+    int8_t delta = 0;
+    uint8_t counter = 0;
+    bool valid = false;
+};
+
+struct pattern_entry{
+    std::array<delta_entry,MAX_DELTAS> deltas;
+    uint8_t total = 0;
+};
+
+class pattern_table{
+    std::array<pattern_entry, PT_ENTRIES> table;
+public:
+    void update(uint32_t signature, int64_t stride){
+        pattern_entry &entry = table[pt_index(static_cast<uint16_t>(signature))];
+
+        // Out-of-page deltas can never be prefetched, so do not store them,
+        // but still count the event so the in-page deltas' confidence is diluted.
+        if (stride > 63 || stride < -63) {
+            if (entry.total < 255) entry.total++;
+            return;
+        }
+        delta_entry* target = nullptr;
+
+        for(auto &d : entry.deltas){
+            if(d.valid && d.delta == stride){
+                target = &d;
+                break;
+            }
+        }
+
+        if(target == nullptr) {
+            for (auto &d : entry.deltas) {
+                if (!d.valid) {
+                    target = &d;
+                    break;
+                }
+            }
+        }
+
+        if(target == nullptr) {
+            target = &*std::min_element(
+                entry.deltas.begin(),
+                entry.deltas.end(),
+                [](const delta_entry &a, const delta_entry &b) {
+                    return a.counter < b.counter;
+                }
+            );
+        }
+
+        if(!target->valid || target->delta != stride) {
+            if(target->valid) entry.total -= target->counter;
+            target->delta = static_cast<int8_t>(stride);
+            target->counter = 0;
+            target->valid = true;
+        }
+
+        entry.total++;
+        target->counter++;
+        if (target->counter >= MAX_COUNTER) {
+            entry.total = 0;
+            for (auto &d : entry.deltas) {
+                d.counter = d.counter/2;
+                entry.total += d.counter;
+            }
+        }
+    }
+
+    bool predict(uint16_t signature,int64_t &predicted_delta, double &conf) {
+        const auto &entry = table[pt_index(signature)];
+
+        if (entry.total == 0)
+            return false;
+
+        const delta_entry* best = nullptr;
+
+        for (const auto &d : entry.deltas) {
+            if (!d.valid)
+                continue;
+
+            if (best == nullptr ||
+                d.counter > best->counter) {
+                best = &d;
+            }
+        }
+
+        if (best == nullptr)
+            return false;
+
+        conf = static_cast<double>(best->counter)/entry.total;
+        predicted_delta = best->delta;
+
+        return true;
+    }
+};
+
+pattern_table pattern_tbl;
+
+class IP_TRACKER{
+
+public:
+    uint16_t ip;
+
+    // use LRU to evict old IP trackers
+    uint16_t lru;   // 9 bits needed for 512 trackers
+    bool non_uniform_mode;
+
+    // Last access, stored compactly: 16-bit page tag + 6-bit line offset within the 4 KB page.
+    // Prefetches never cross a page, so the prefetch pointer is a 6-bit offset in the same page.
+    bool     valid;       // tracker has recorded at least one access
+    uint16_t page_tag;    // low 16 bits of the page number of the last access
+    uint8_t  line_off;    // line offset (0..63) of the last access within its page
+    bool     pf_valid;    // prefetch pointer holds a value
+    uint8_t  pf_off;      // furthest line offset issued for the current uniform stream
+    int16_t last_stride;
+
+    uint16_t signature;
+    uint8_t uniform_confidence;
+    uint8_t break_confidence;
+
+    IP_TRACKER(): ip(0),lru(0),non_uniform_mode(0),valid(false),page_tag(0),line_off(0),pf_valid(false),pf_off(0),
+    last_stride(0),signature(0),uniform_confidence(0),break_confidence(0) {}
+
+    static uint16_t tag_of(uint64_t cl_addr) { return static_cast<uint16_t>((cl_addr >> 6) & 0xFFFF); }
+    static uint8_t  off_of(uint64_t cl_addr) { return static_cast<uint8_t>(cl_addr & 63); }
+
+    bool same_line(uint64_t cl_addr) const {
+        return valid && tag_of(cl_addr) == page_tag && off_of(cl_addr) == line_off;
+    }
+
+    void reset_to(uint64_t cl_addr) {
+        valid = true; page_tag = tag_of(cl_addr); line_off = off_of(cl_addr);
+        pf_valid = false; pf_off = 0;
+        last_stride = 0; signature = 0; non_uniform_mode = false;
+        uniform_confidence = 0; break_confidence = 0;
+    }
+
+    static uint16_t next_sig(uint16_t sig, int64_t delta) {
+        uint64_t mag = static_cast<uint64_t>(delta < 0 ? -delta : delta);
+        mag = std::min<uint64_t>(mag, 63);
+        uint16_t enc = static_cast<uint16_t>(mag);
+        if (delta < 0) enc |= (1 << 6);
+        return static_cast<uint16_t>(((sig << 3) ^ enc) & 0xFFF);
+    }
+
+    void update_signature(int64_t delta){
+        signature = next_sig(signature, delta);
+    }
+
+    void update_mode(int64_t delta){
+        if (uniform_confidence == 0 &&
+            break_confidence == 0 &&
+            last_stride == 0) {
+
+            uniform_confidence = 1;
+            return;
+        }
+
+        if (delta == last_stride) {
+
+            if (uniform_confidence < MAX_COUNTER)
+                uniform_confidence++;
+
+            if (break_confidence > 0)
+                break_confidence--;
+
+            // Stable uniform pattern detected again
+            if (non_uniform_mode &&
+                uniform_confidence >= UNIFORM_THRESHOLD) {
+
+                non_uniform_mode = false;
+                break_confidence = 0;
+            }
+        }
+        else {
+
+            if (break_confidence < MAX_COUNTER)
+                break_confidence++;
+
+            uniform_confidence=0;
+
+            // Require multiple mismatches before switching
+            if (!non_uniform_mode &&
+                break_confidence >=
+                    NON_UNIFORM_THRESHOLD) {
+
+                non_uniform_mode = true;
+                uniform_confidence = 0;
+            }
+        }
+    }
+
+    void update_pattern(uint32_t sig, int64_t delta){
+        pattern_tbl.update(sig,delta);
+    }
+
+    void update(uint64_t current_cl_address){
+        uint16_t tag = tag_of(current_cl_address);
+        uint8_t  off = off_of(current_cl_address);
+
+        if (!valid) {
+            valid = true; page_tag = tag; line_off = off;
+            return;
+        }
+
+        // Reconstruct the line delta. It is exact whenever |delta| < 64 (same page or an
+        // adjacent page); anything further is an out-of-page jump that could never be
+        // prefetched, so it is represented by a +-64 sentinel.
+        int16_t pdiff = static_cast<int16_t>(static_cast<uint16_t>(tag - page_tag));
+        int64_t delta;
+        if      (pdiff == 0)  delta = static_cast<int64_t>(off) - line_off;
+        else if (pdiff == 1)  delta = 64 + static_cast<int64_t>(off) - line_off;
+        else if (pdiff == -1) delta = -64 + static_cast<int64_t>(off) - line_off;
+        else                  delta = (pdiff > 0) ? 64 : -64;
+
+        if (delta == 0) return;
+
+        update_pattern(signature, delta);
+        update_mode(delta);
+
+        update_signature(delta);
+        // New stream or new page: the prefetch pointer no longer applies
+        if (delta != last_stride || pdiff != 0) pf_valid = false;
+        last_stride = (delta > 63 || delta < -63) ? 0 : static_cast<int16_t>(delta);
+        page_tag = tag; line_off = off;
+    }
+
+    // current_cl is the line address of the access that just trained this tracker
+    int predict(uint64_t predicted_addr[], int degree, int distance, uint64_t current_cl){
+        int64_t predicted_stride;
+
+        uint64_t current_addr = current_cl;
+        uint64_t current_page = current_cl >> 6;
+        uint16_t current_signature = signature;
+
+        int count = 0;
+        double path_conf = 1;
+
+        // Uniform mode: extend the window by distance-1 lines when prefetches run late.
+        // The pointer below means only lines beyond the previous window are issued.
+        int window = degree + (non_uniform_mode ? 0 : distance - 1);
+        for (int d = 0; d < window; d++){
+
+            if (!non_uniform_mode) {
+                if (uniform_confidence < 2 || last_stride == 0) break;
+                predicted_stride = last_stride;
+            }
+
+            else{
+                double c;
+                if (!pattern_tbl.predict(current_signature, predicted_stride, c)) break;
+                path_conf *= c;
+                if (path_conf <  prediction_threshold) break;
+            }
+
+            uint64_t next_addr;
+
+            if (predicted_stride >= 0) {
+                next_addr = current_addr +
+                    static_cast<uint64_t>(
+                        predicted_stride
+                    );
+            } 
+            else {
+                next_addr = current_addr -
+                    static_cast<uint64_t>(
+                        -predicted_stride
+                    );
+            }
+            // Uniform mode: skip lines already issued for this stream (pointer is an
+            // offset within the current page; anything outside the page is dropped later)
+            bool covered = false;
+            if (!non_uniform_mode && pf_valid && (next_addr >> 6) == current_page) {
+                uint8_t noff = off_of(next_addr);
+                covered = (predicted_stride > 0) ? (noff <= pf_off) : (noff >= pf_off);
+            }
+
+            if (!covered) {
+                predicted_addr[count] = next_addr;
+                count++;
+            }
+
+            current_addr = next_addr;
+
+            current_signature = next_sig(current_signature, predicted_stride);
+        }
+
+        if (!non_uniform_mode && count > 0) {
+            uint64_t last = predicted_addr[count - 1];
+            if ((last >> 6) == current_page) pf_off = off_of(last);
+            else                             pf_off = (predicted_stride > 0) ? 63 : 0;  // page fully covered
+            pf_valid = true;
+        }
+        return count;
+    }
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];
 
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+    for (int i=0; i<IP_TRACKER_COUNT; i++) trackers[i].lru = static_cast<uint16_t>(i);
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    if(type==PREFETCH) return;
+
+    uint64_t lower = pf_lower_level - last_pf_lower;
+    if (lower >= EPOCH_PREFETCHES) {
+        uint64_t useful = pf_useful - last_pf_useful;
+        double acc = static_cast<double>(useful) / lower;
+        if(acc > 1.0) acc = 1.0;
+
+        // Distance: push further ahead when prefetches arrive late, pull back when timely
+        uint64_t late = pf_late - last_pf_late;
+        double late_ratio = (useful + late) ? static_cast<double>(late) / static_cast<double>(useful + late) : 0.0;
+        if      (late_ratio > 0.25 && prefetch_distance < MAX_DISTANCE) prefetch_distance++;
+        else if (late_ratio < 0.10 && prefetch_distance > 1)            prefetch_distance--;
+        epochs_at_distance[prefetch_distance]++;
+
+        if(acc >= 0.75) {prefetch_degree = 4;  prediction_threshold = 0.20;}
+        else if(acc >= 0.50) {prefetch_degree = 3;  prediction_threshold = 0.25;}
+        else if(acc >= 0.25) {prefetch_degree = 2;  prediction_threshold = 0.35;}
+        else {prefetch_degree = 1;  prediction_threshold = 0.50;}
+
+        epochs_at_degree[prefetch_degree]++;
+        last_pf_useful = pf_useful;
+        last_pf_lower = pf_lower_level;
+        last_pf_late = pf_late;
+        epoch_issued = 0;
+    }
+
+    // check for a tracker hit
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    ip = ip & MASK_IP;
+
+    int index = -1;
+    for (index=0; index<IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
+    }
+
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == IP_TRACKER_COUNT) {
+
+        for (index=0; index<IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
+                break;
+        }
+
+        tracker_allocs++;
+        trackers[index].ip = static_cast<uint16_t>(ip);
+        trackers[index].reset_to(cl_addr);
+
+        for (int i=0; i<IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+
+        return;
+
+    }
+
+    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+
+    if (trackers[index].same_line(cl_addr)) return;
+    trackers[index].update(cl_addr);
+
+    uint64_t predictions[MAX_DEGREE + MAX_DISTANCE - 1];
+
+    int degree = prefetch_degree;
+    if (!trackers[index].non_uniform_mode && degree < MAX_DEGREE) degree++;
+
+    int count = trackers[index].predict(predictions, degree, prefetch_distance, cl_addr);
+    for (int i = 0; i < count; i++) {
+
+        if(predictions[i] == cl_addr) continue;
+
+        uint64_t pf_addr =predictions[i] << LOG2_BLOCK_SIZE;
+
+        if ((pf_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) {
+            if (!trackers[index].non_uniform_mode) break;
+            continue;
+        }
+
+        if (MSHR.occupancy < (MSHR.SIZE>>1)) {
+            if(prefetch_line(ip, addr, pf_addr, FILL_L1, 0)) epoch_issued++;
+        }
+        else{
+            prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+        }
+    }
+    
+    return; 
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
@@ -20,5 +450,9 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    for (int d = 1; d <= MAX_DEGREE; d++)
+        std::cout << "SPP epochs at degree " << d << ": " << epochs_at_degree[d] << std::endl;
+    for (int d = 1; d <= MAX_DISTANCE; d++)
+        std::cout << "SPP epochs at distance " << d << ": " << epochs_at_distance[d] << std::endl;
+    std::cout << "SPP tracker allocations: " << tracker_allocs << std::endl;
 }
