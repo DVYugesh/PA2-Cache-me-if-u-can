@@ -2,19 +2,22 @@
 
 #define maxRRPV 3
 
-#define MAX_INSTR_WAYS 4
-#define INSTR_INSERT_RRPV 1
+// ---- experiment knobs ----
+#define MAX_INSTR_WAYS     4   // instruction lines are protected only while a set holds <= this many (try 2, 4, 6)
+#define INSTR_INSERT_RRPV  1   // 0 = max protection, 1 = medium, 2 = same as data
+// --------------------------
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
-bool l2_is_instr[L2C_SET][L2C_WAY];
+bool     l2_is_instr[L2C_SET][L2C_WAY];   // does this way hold an instruction line?
 
+// debug counters (printed at end of simulation)
 uint64_t irrip_instr_fills = 0, irrip_data_fills = 0;
-uint64_t irrip_instr_hits = 0, irrip_data_hits = 0;
+uint64_t irrip_instr_hits  = 0, irrip_data_hits  = 0;
 
 // initialize replacement state
 void CACHE::l2c_initialize_replacement()
 {
-    cout << "Initialize Instruction-Conscious RRIP (I-RRIP) state for L2C" << endl;
+    cout << "Initialize Instruction-Conscious RRIP (I-RRIP v3) state for L2C" << endl;
 
     for (int i=0; i<L2C_SET; i++) {
         for (int j=0; j<L2C_WAY; j++) {
@@ -25,6 +28,11 @@ void CACHE::l2c_initialize_replacement()
 }
 
 // find replacement victim
+// 1) Use an invalid way if one exists.
+// 2) Instruction lines are protected from eviction only while the set holds at most
+//    MAX_INSTR_WAYS of them (and at least one non-instruction line exists), so stale
+//    instruction lines cannot take over the whole set.
+// 3) Otherwise standard RRIP: evict a line at maxRRPV, aging the set if none is there.
 uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
     for (int i=0; i<L2C_WAY; i++)
@@ -43,6 +51,7 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
             if (l2_rrpv[set][i] >= maxRRPV && !(protect_instr && l2_is_instr[set][i]))
                 return i;
 
+        // age all lines, capped at maxRRPV
         for (int i=0; i<L2C_WAY; i++)
             if (l2_rrpv[set][i] < maxRRPV)
                 l2_rrpv[set][i]++;
@@ -91,9 +100,8 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
             irrip_data_hits++;
         }
         l2_rrpv[set][way] = 0;
-    } 
-    else {
-        // INSERTION: instruction lines get a better RRPV than data lines.
+    } else {
+        // INSERTION: instruction lines get a better (lower) RRPV than data lines.
         if (isInstruction) {
             irrip_instr_fills++;
             l2_is_instr[set][way] = true;
