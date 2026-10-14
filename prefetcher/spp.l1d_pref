@@ -14,10 +14,10 @@
 
 #define MAX_DELTAS 4
 
-// Pattern table size: 2^PT_BITS entries. The 12-bit signature is folded down when PT_BITS < 12.
 #define PT_BITS 10
 #define PT_ENTRIES (1 << PT_BITS)
-static inline uint16_t pt_index(uint16_t sig) {
+
+uint16_t pt_index(uint16_t sig) {
     return static_cast<uint16_t>((sig ^ (sig >> PT_BITS)) & (PT_ENTRIES - 1));
 }
 
@@ -27,11 +27,10 @@ uint64_t last_pf_useful = 0;
 uint64_t last_pf_lower = 0;
 uint64_t epochs_at_degree[MAX_DEGREE + 1] = {0};
 double prediction_threshold = 0.25;
-uint64_t tracker_allocs = 0;   // stats only: how often an IP tracker is (re)allocated
 
-// Adaptive prefetch distance driven by the late-prefetch ratio
+
 #define MAX_DISTANCE 8
-int      prefetch_distance = 1;
+int prefetch_distance = 1;
 uint64_t last_pf_late = 0;
 uint64_t epochs_at_distance[MAX_DISTANCE + 1] = {0};
 
@@ -53,8 +52,6 @@ public:
     void update(uint32_t signature, int64_t stride){
         pattern_entry &entry = table[pt_index(static_cast<uint16_t>(signature))];
 
-        // Out-of-page deltas can never be prefetched, so do not store them,
-        // but still count the event so the in-page deltas' confidence is diluted.
         if (stride > 63 || stride < -63) {
             if (entry.total < 255) entry.total++;
             return;
@@ -106,14 +103,14 @@ public:
     }
 
     bool predict(uint16_t signature,int64_t &predicted_delta, double &conf) {
-        const auto &entry = table[pt_index(signature)];
+        auto &entry = table[pt_index(signature)];
 
         if (entry.total == 0)
             return false;
 
-        const delta_entry* best = nullptr;
+        delta_entry* best = nullptr;
 
-        for (const auto &d : entry.deltas) {
+        for (auto &d : entry.deltas) {
             if (!d.valid)
                 continue;
 
@@ -140,17 +137,16 @@ class IP_TRACKER{
 public:
     uint16_t ip;
 
-    // use LRU to evict old IP trackers
     uint16_t lru;   // 9 bits needed for 512 trackers
     bool non_uniform_mode;
 
-    // Last access, stored compactly: 16-bit page tag + 6-bit line offset within the 4 KB page.
+    //Last access, stored compactly: 16-bit page tag + 6-bit line offset within the 4 KB page.
     // Prefetches never cross a page, so the prefetch pointer is a 6-bit offset in the same page.
-    bool     valid;       // tracker has recorded at least one access
-    uint16_t page_tag;    // low 16 bits of the page number of the last access
-    uint8_t  line_off;    // line offset (0..63) of the last access within its page
-    bool     pf_valid;    // prefetch pointer holds a value
-    uint8_t  pf_off;      // furthest line offset issued for the current uniform stream
+    bool valid;
+    uint16_t page_tag;
+    uint8_t line_off;
+    bool pf_valid;
+    uint8_t pf_off;
     int16_t last_stride;
 
     uint16_t signature;
@@ -163,14 +159,19 @@ public:
     static uint16_t tag_of(uint64_t cl_addr) { return static_cast<uint16_t>((cl_addr >> 6) & 0xFFFF); }
     static uint8_t  off_of(uint64_t cl_addr) { return static_cast<uint8_t>(cl_addr & 63); }
 
-    bool same_line(uint64_t cl_addr) const {
+    bool same_line(uint64_t cl_addr) {
         return valid && tag_of(cl_addr) == page_tag && off_of(cl_addr) == line_off;
     }
 
     void reset_to(uint64_t cl_addr) {
-        valid = true; page_tag = tag_of(cl_addr); line_off = off_of(cl_addr);
-        pf_valid = false; pf_off = 0;
-        last_stride = 0; signature = 0; non_uniform_mode = false;
+        valid = true; 
+        page_tag = tag_of(cl_addr); 
+        line_off = off_of(cl_addr);
+        pf_valid = false; 
+        pf_off = 0;
+        last_stride = 0; 
+        signature = 0; 
+        non_uniform_mode = false;
         uniform_confidence = 0; break_confidence = 0;
     }
 
@@ -203,7 +204,6 @@ public:
             if (break_confidence > 0)
                 break_confidence--;
 
-            // Stable uniform pattern detected again
             if (non_uniform_mode &&
                 uniform_confidence >= UNIFORM_THRESHOLD) {
 
@@ -218,11 +218,7 @@ public:
 
             uniform_confidence=0;
 
-            // Require multiple mismatches before switching
-            if (!non_uniform_mode &&
-                break_confidence >=
-                    NON_UNIFORM_THRESHOLD) {
-
+            if (!non_uniform_mode && break_confidence >= NON_UNIFORM_THRESHOLD) {
                 non_uniform_mode = true;
                 uniform_confidence = 0;
             }
@@ -242,29 +238,25 @@ public:
             return;
         }
 
-        // Reconstruct the line delta. It is exact whenever |delta| < 64 (same page or an
-        // adjacent page); anything further is an out-of-page jump that could never be
-        // prefetched, so it is represented by a +-64 sentinel.
         int16_t pdiff = static_cast<int16_t>(static_cast<uint16_t>(tag - page_tag));
         int64_t delta;
-        if      (pdiff == 0)  delta = static_cast<int64_t>(off) - line_off;
-        else if (pdiff == 1)  delta = 64 + static_cast<int64_t>(off) - line_off;
-        else if (pdiff == -1) delta = -64 + static_cast<int64_t>(off) - line_off;
-        else                  delta = (pdiff > 0) ? 64 : -64;
+        if (pdiff == 0) delta = static_cast<int64_t>(off) - line_off;
+        else if(pdiff == 1) delta = 64 + static_cast<int64_t>(off) - line_off;
+        else if(pdiff == -1)delta = -64 + static_cast<int64_t>(off) - line_off;
+        else delta = (pdiff > 0) ? 64 : -64;
 
-        if (delta == 0) return;
+        if(delta == 0) return;
 
         update_pattern(signature, delta);
         update_mode(delta);
 
         update_signature(delta);
-        // New stream or new page: the prefetch pointer no longer applies
+        
         if (delta != last_stride || pdiff != 0) pf_valid = false;
         last_stride = (delta > 63 || delta < -63) ? 0 : static_cast<int16_t>(delta);
         page_tag = tag; line_off = off;
     }
 
-    // current_cl is the line address of the access that just trained this tracker
     int predict(uint64_t predicted_addr[], int degree, int distance, uint64_t current_cl){
         int64_t predicted_stride;
 
@@ -275,8 +267,6 @@ public:
         int count = 0;
         double path_conf = 1;
 
-        // Uniform mode: extend the window by distance-1 lines when prefetches run late.
-        // The pointer below means only lines beyond the previous window are issued.
         int window = degree + (non_uniform_mode ? 0 : distance - 1);
         for (int d = 0; d < window; d++){
 
@@ -295,19 +285,12 @@ public:
             uint64_t next_addr;
 
             if (predicted_stride >= 0) {
-                next_addr = current_addr +
-                    static_cast<uint64_t>(
-                        predicted_stride
-                    );
+                next_addr = current_addr + static_cast<uint64_t>(predicted_stride);
             } 
             else {
-                next_addr = current_addr -
-                    static_cast<uint64_t>(
-                        -predicted_stride
-                    );
+                next_addr = current_addr - static_cast<uint64_t>(-predicted_stride);
             }
-            // Uniform mode: skip lines already issued for this stream (pointer is an
-            // offset within the current page; anything outside the page is dropped later)
+            
             bool covered = false;
             if (!non_uniform_mode && pf_valid && (next_addr >> 6) == current_page) {
                 uint8_t noff = off_of(next_addr);
@@ -327,7 +310,7 @@ public:
         if (!non_uniform_mode && count > 0) {
             uint64_t last = predicted_addr[count - 1];
             if ((last >> 6) == current_page) pf_off = off_of(last);
-            else                             pf_off = (predicted_stride > 0) ? 63 : 0;  // page fully covered
+            else pf_off = (predicted_stride > 0) ? 63 : 0;
             pf_valid = true;
         }
         return count;
@@ -351,14 +334,15 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     uint64_t lower = pf_lower_level - last_pf_lower;
     if (lower >= EPOCH_PREFETCHES) {
         uint64_t useful = pf_useful - last_pf_useful;
-        double acc = static_cast<double>(useful) / lower;
+        double acc = static_cast<double>(useful)/lower;
         if(acc > 1.0) acc = 1.0;
 
-        // Distance: push further ahead when prefetches arrive late, pull back when timely
         uint64_t late = pf_late - last_pf_late;
-        double late_ratio = (useful + late) ? static_cast<double>(late) / static_cast<double>(useful + late) : 0.0;
-        if      (late_ratio > 0.25 && prefetch_distance < MAX_DISTANCE) prefetch_distance++;
-        else if (late_ratio < 0.10 && prefetch_distance > 1)            prefetch_distance--;
+        double late_ratio = (useful + late) ? static_cast<double>(late)/static_cast<double>(useful + late) : 0.0;
+
+        if(late_ratio > 0.25 && prefetch_distance < MAX_DISTANCE) prefetch_distance++;
+        else if(late_ratio < 0.10 && prefetch_distance > 1) prefetch_distance--;
+
         epochs_at_distance[prefetch_distance]++;
 
         if(acc >= 0.75) {prefetch_degree = 4;  prediction_threshold = 0.20;}
@@ -392,7 +376,6 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
                 break;
         }
 
-        tracker_allocs++;
         trackers[index].ip = static_cast<uint16_t>(ip);
         trackers[index].reset_to(cl_addr);
 
@@ -407,7 +390,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     }
 
     for (int i=0; i<IP_TRACKER_COUNT; i++) {
-        if (trackers[i].lru < trackers[index].lru)
+        if(trackers[i].lru < trackers[index].lru)
             trackers[i].lru++;
     }
     trackers[index].lru = 0;
@@ -454,5 +437,4 @@ void CACHE::l1d_prefetcher_final_stats()
         std::cout << "SPP epochs at degree " << d << ": " << epochs_at_degree[d] << std::endl;
     for (int d = 1; d <= MAX_DISTANCE; d++)
         std::cout << "SPP epochs at distance " << d << ": " << epochs_at_distance[d] << std::endl;
-    std::cout << "SPP tracker allocations: " << tracker_allocs << std::endl;
 }
