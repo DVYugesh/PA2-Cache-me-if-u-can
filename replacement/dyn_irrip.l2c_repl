@@ -1,13 +1,17 @@
 #include "cache.h"
 
 // ============================================================================
-//  On every demand access to a leader set we count instruction and non-instruction
-//  accesses and misses.  At the end of each epoch the leader counters give the
-//  Instruction Yield Ratio
+//  Prefetch-aware Dynamic I-RRIP for the L2C
+//
+//  Part 2b: Dynamic I-RRIP
+//
+//  On every demand access (LOAD or RFO) to a leader set we count instruction and
+//  non-instruction accesses and misses. Every EPOCH_LEADER_ACCESSES such accesses
+//  an epoch closes and the leader counters give the Instruction Yield Ratio
 //
 //        IYR = (instr hits / (instr misses+1)) * (instr accesses / total accesses)
 //
-//  i.e. instruction reuse multiplied by instruction intensity. When IYR exceeds
+//  i.e. instruction reuse multiplied by instruction intensity.  When IYR exceeds
 //  IYR_THRESHOLD the follower sets run I-RRIP for the next epoch, otherwise they
 //  run SRRIP. The counters are reset at every epoch.
 //
@@ -22,6 +26,15 @@
 //    standard SRRIP: insert at maxRRPV-1, promote to 0, evict any line at maxRRPV.
 //
 //  State per line: RRPV (2 bits), instruction flag (1 bit), reused flag (1 bit).
+//
+//  Part 3: Prefetch awareness
+//
+//  With SPP enabled at the L1D, the L2 receives packets of type PREFETCH. Two
+//  rules treat them as lower-confidence than demand packets:
+//    1. a line filled by a prefetch is inserted at RRPV PREFETCH_INSERT_RRPV = 3
+//       in both modes.
+//    2. a hit by a prefetch packet does not promote the line or mark it reused,
+//       because a prefetch touching a line says nothing about demand reuse.
 // ============================================================================
 
 #define maxRRPV 3
@@ -31,6 +44,7 @@
 #define IYR_THRESHOLD 0.15
 #define MAX_INSTR_WAYS 4
 #define INSTR_INSERT_RRPV 1
+#define PREFETCH_INSERT_RRPV 3
 
 #define REGION_SIZE (L2C_SET/NUM_LEADER_SETS)
 
@@ -72,17 +86,19 @@ void leader_observe(bool is_instr, bool hit){
     double iyr = reuse*intensity;
 
     bool new_mode = (iyr > IYR_THRESHOLD);
-    if (new_mode != irrip_mode) stat_switches++;
+    if(new_mode != irrip_mode) stat_switches++;
     irrip_mode = new_mode;
 
     if (irrip_mode) stat_epochs_irrip++; else stat_epochs_rrip++;
-    int b = static_cast<int>(iyr * 10); if (b > 9) b = 9; if (b < 0) b = 0;
+    int b = static_cast<int>(iyr * 10); 
+    if(b > 9) b = 9; 
+    if(b < 0) b = 0;
     stat_iyr_hist[b]++;
 
     ep_instr_acc = ep_instr_miss = ep_total_acc = ep_total_miss = 0;
 }
 
-// Victim selection.  irrip_rules = false gives plain SRRIP.  irrip_rules = true
+// Victim selection. irrip_rules = false gives plain SRRIP.  irrip_rules = true
 // adds instruction protection and prefers never-reused lines as victims.
 // Both start by using an invalid way if one exists.
 uint32_t select_victim(uint32_t set, const BLOCK *current_set, bool irrip_rules){
@@ -106,7 +122,7 @@ uint32_t select_victim(uint32_t set, const BLOCK *current_set, bool irrip_rules)
                 if (l2_rrpv[set][i] >= maxRRPV && !l2_reused[set][i] &&!(protect_instr && l2_is_instr[set][i]))
                     return i;
         }
-        // otherwise any unprotected line at maxRRPV (protection is off in SRRIP mode)
+        // otherwise any unprotected line at maxRRPV
         for (int i = 0; i < L2C_WAY; i++)
             if (l2_rrpv[set][i] >= maxRRPV && !(protect_instr && l2_is_instr[set][i]))
                 return i;
@@ -117,8 +133,9 @@ uint32_t select_victim(uint32_t set, const BLOCK *current_set, bool irrip_rules)
     }
 }
 
-void update_line(uint32_t set, uint32_t way, bool hit, bool is_instr, bool irrip_rules){
+void update_line(uint32_t set, uint32_t way, bool hit, bool is_instr, bool irrip_rules, bool is_prefetch){
     if (hit){
+        if (is_prefetch) return; //a prefetch hit is not demand reuse: no promotion, no reused flag
         if (is_instr) l2_is_instr[set][way] = true;
         l2_reused[set][way] = true;
         l2_rrpv[set][way] = 0; // PROMOTION
@@ -126,11 +143,14 @@ void update_line(uint32_t set, uint32_t way, bool hit, bool is_instr, bool irrip
     }
     l2_is_instr[set][way] = is_instr; // INSERTION
     l2_reused[set][way] = false;
-    l2_rrpv[set][way] = (irrip_rules && is_instr) ? INSTR_INSERT_RRPV : (maxRRPV - 1);
+    if (is_prefetch) // prefetched lines enter at the distant RRPV
+        l2_rrpv[set][way] = PREFETCH_INSERT_RRPV;
+    else
+        l2_rrpv[set][way] = (irrip_rules && is_instr) ? INSTR_INSERT_RRPV : (maxRRPV - 1);
 }
 
 void CACHE::l2c_initialize_replacement(){
-    cout << "Initialize Dynamic I-RRIP state for L2C " << endl;
+    cout << "Initialize Prefetch-aware Dynamic I-RRIP state for L2C " << endl;
 
     for (int i = 0; i < L2C_SET; i++)
         for (int j = 0; j < L2C_WAY; j++) {
@@ -157,7 +177,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     if (is_demand(type) && is_leader_set(set))
         leader_observe(is_instr, hit != 0);
 
-    update_line(set, way, hit != 0, is_instr, irrip_mode && !is_leader_set(set));
+    update_line(set, way, hit != 0, is_instr, irrip_mode && !is_leader_set(set), type == PREFETCH);
 }
 
 void CACHE::l2c_replacement_final_stats()
