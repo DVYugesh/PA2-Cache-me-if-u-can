@@ -2,14 +2,14 @@
 
 #define maxRRPV 3
 
-#define MAX_INSTR_WAYS 4   // instruction lines are protected only while a set holds <= this many
-#define INSTR_INSERT_RRPV 1   // 0 = max protection, 1 = medium, 2 = same as data
+#define MAX_INSTR_WAYS 4  // instruction lines are protected only while a set holds <= this many
+#define INSTR_INSERT_RRPV 1  // 0 = max protection, 1 = medium, 2 = same as data
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
-bool l2_is_instr[L2C_SET][L2C_WAY];   // does this way hold an instruction line?
+bool l2_is_instr[L2C_SET][L2C_WAY]; // does this way hold an instruction line?
 
 uint64_t irrip_instr_fills = 0, irrip_data_fills = 0;
-uint64_t irrip_instr_hits  = 0, irrip_data_hits  = 0;
+uint64_t irrip_instr_hits = 0, irrip_data_hits = 0;
 
 // initialize replacement state
 void CACHE::l2c_initialize_replacement()
