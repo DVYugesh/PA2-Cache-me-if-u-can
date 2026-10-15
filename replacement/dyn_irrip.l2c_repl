@@ -1,0 +1,170 @@
+#include "cache.h"
+
+// ============================================================================
+//  On every demand access to a leader set we count instruction and non-instruction
+//  accesses and misses.  At the end of each epoch the leader counters give the
+//  Instruction Yield Ratio
+//
+//        IYR = (instr hits / (instr misses+1)) * (instr accesses / total accesses)
+//
+//  i.e. instruction reuse multiplied by instruction intensity. When IYR exceeds
+//  IYR_THRESHOLD the follower sets run I-RRIP for the next epoch, otherwise they
+//  run SRRIP. The counters are reset at every epoch.
+//
+//  I-RRIP mode:
+//    insertion  - instruction lines enter at RRPV INSTR_INSERT_RRPV, data at maxRRPV-1
+//    promotion  - every hit goes to RRPV 0 (same as SRRIP)
+//    eviction   - a line at maxRRPV is a candidate only if it is not a protected
+//                 instruction line (protection applies while the set holds at most
+//                 MAX_INSTR_WAYS instruction lines); among candidates, a line that has
+//                 never been hit since insertion is evicted before one that has.
+//  SRRIP mode:
+//    standard SRRIP: insert at maxRRPV-1, promote to 0, evict any line at maxRRPV.
+//
+//  State per line: RRPV (2 bits), instruction flag (1 bit), reused flag (1 bit).
+// ============================================================================
+
+#define maxRRPV 3
+
+#define NUM_LEADER_SETS 32
+#define EPOCH_LEADER_ACCESSES 4096
+#define IYR_THRESHOLD 0.15
+#define MAX_INSTR_WAYS 4
+#define INSTR_INSERT_RRPV 1
+
+#define REGION_SIZE (L2C_SET/NUM_LEADER_SETS)
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+bool l2_is_instr[L2C_SET][L2C_WAY];
+bool l2_reused[L2C_SET][L2C_WAY];
+
+bool irrip_mode = false;
+uint64_t ep_instr_acc = 0, ep_instr_miss = 0;
+uint64_t ep_total_acc = 0, ep_total_miss = 0;
+
+
+uint64_t stat_epochs_irrip = 0, stat_epochs_rrip = 0, stat_switches = 0;
+uint64_t stat_iyr_hist[10] = {0};
+
+//  Leader-set selection - one set per region, at an offset equal to the region index
+bool is_leader_set(uint32_t set){
+    return (set % REGION_SIZE) == (set / REGION_SIZE) % REGION_SIZE;
+}
+
+bool is_demand(uint32_t type){
+    return type == LOAD || (type == RFO);
+}
+
+//  Epoch logic: called on every demand access to a leader set.
+void leader_observe(bool is_instr, bool hit){
+    ep_total_acc++;
+    if(!hit) ep_total_miss++;
+    if(is_instr) {
+        ep_instr_acc++;
+        if(!hit) ep_instr_miss++;
+    }
+
+    if(ep_total_acc<EPOCH_LEADER_ACCESSES) return;
+
+    double instr_hits = static_cast<double>(ep_instr_acc-ep_instr_miss);
+    double reuse = instr_hits/static_cast<double>(ep_instr_miss+1);
+    double intensity = static_cast<double>(ep_instr_acc)/static_cast<double>(ep_total_acc);
+    double iyr = reuse*intensity;
+
+    bool new_mode = (iyr > IYR_THRESHOLD);
+    if (new_mode != irrip_mode) stat_switches++;
+    irrip_mode = new_mode;
+
+    if (irrip_mode) stat_epochs_irrip++; else stat_epochs_rrip++;
+    int b = static_cast<int>(iyr * 10); if (b > 9) b = 9; if (b < 0) b = 0;
+    stat_iyr_hist[b]++;
+
+    ep_instr_acc = ep_instr_miss = ep_total_acc = ep_total_miss = 0;
+}
+
+// Victim selection.  irrip_rules = false gives plain SRRIP.  irrip_rules = true
+// adds instruction protection and prefers never-reused lines as victims.
+// Both start by using an invalid way if one exists.
+uint32_t select_victim(uint32_t set, const BLOCK *current_set, bool irrip_rules){
+    for (int i = 0;i < L2C_WAY; i++){
+        if (!current_set[i].valid) return i;
+    }
+
+    bool protect_instr = false;
+    if (irrip_rules){
+        int n_instr = 0;
+        for (int i = 0;i < L2C_WAY;i++){
+            if (l2_is_instr[set][i]) n_instr++;
+        }
+        protect_instr = (n_instr <= MAX_INSTR_WAYS) && (n_instr < L2C_WAY);
+    }
+
+    while (1){
+        if (irrip_rules) {
+            // first choice: a never-reused, unprotected line at maxRRPV
+            for (int i = 0;i < L2C_WAY; i++)
+                if (l2_rrpv[set][i] >= maxRRPV && !l2_reused[set][i] &&!(protect_instr && l2_is_instr[set][i]))
+                    return i;
+        }
+        // otherwise any unprotected line at maxRRPV (protection is off in SRRIP mode)
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] >= maxRRPV && !(protect_instr && l2_is_instr[set][i]))
+                return i;
+        // none: age the set and search again
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] < maxRRPV)
+                l2_rrpv[set][i]++;
+    }
+}
+
+void update_line(uint32_t set, uint32_t way, bool hit, bool is_instr, bool irrip_rules){
+    if (hit){
+        if (is_instr) l2_is_instr[set][way] = true;
+        l2_reused[set][way] = true;
+        l2_rrpv[set][way] = 0; // PROMOTION
+        return;
+    }
+    l2_is_instr[set][way] = is_instr; // INSERTION
+    l2_reused[set][way] = false;
+    l2_rrpv[set][way] = (irrip_rules && is_instr) ? INSTR_INSERT_RRPV : (maxRRPV - 1);
+}
+
+void CACHE::l2c_initialize_replacement(){
+    cout << "Initialize Dynamic I-RRIP state for L2C " << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = false;
+            l2_reused[i][j] = false;
+        }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set,
+                                uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    return select_victim(set, current_set, irrip_mode && !is_leader_set(set));
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip,
+                                         uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    bool is_instr = (isInstruction != 0);
+
+    if (is_demand(type) && is_leader_set(set))
+        leader_observe(is_instr, hit != 0);
+
+    update_line(set, way, hit != 0, is_instr, irrip_mode && !is_leader_set(set));
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "DYN-IRRIP epochs: " << stat_epochs_irrip + stat_epochs_rrip << "  in I-RRIP mode: " << stat_epochs_irrip
+         << "  in RRIP mode: " << stat_epochs_rrip << "  mode switches: " << stat_switches << endl;
+    cout << "DYN-IRRIP IYR histogram (tenths):";
+    for (int b = 0; b < 10; b++) cout << " " << stat_iyr_hist[b];
+    cout << endl;
+}
